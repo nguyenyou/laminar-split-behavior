@@ -111,6 +111,58 @@ Both re-create the element on every toggle. The key differences:
 
 - Signal is already distinct (e.g., a simple `Var` toggle) and elements are cheap. Overhead difference is negligible.
 
+## What if you split everything?
+
+It works — splits nest and compose without correctness issues. But there are consequences.
+
+### Each split creates infrastructure
+
+Every split operator instantiates:
+- A `SplitSignal` with a `mutable.Map` for memoization
+- A `SplitChildSignal` per active key (with its own observer)
+- A `SyncDelayStream` (shared delayed parent)
+
+For collection splits with persistent keys, this is well worth it. For binary/enum splits, the overhead buys almost nothing — only 1 key is ever active, the other is always evicted. You pay the cost of map lookup, eviction loop, and observer add/remove on every state change with **no caching benefit**. The only win is dedup on same-value emissions.
+
+### Nested binary splits: the expensive case
+
+```scala
+outerSignal.splitBoolean(
+  whenTrue = { _ =>
+    innerSignal.splitBoolean(
+      whenTrue = { _ => expensiveTree },
+      whenFalse = { _ => otherExpensiveTree }
+    )
+  },
+  whenFalse = { _ => ... }
+)
+```
+
+Toggling the **outer** split:
+1. Evicts the outer cache entry
+2. Destroys the inner `SplitSignal` entirely (its memoized map, child signals, observers)
+3. When outer re-enters, inner split is rebuilt from scratch — new `SplitSignal`, new `SplitChildSignal`, `project` called again
+
+Every layer of nesting multiplies the teardown/rebuild cost.
+
+### The real cost: DOM churn, not memory
+
+Split doesn't leak memory (eviction is aggressive). The problem is the opposite — it's **too eager to discard**. Each toggle at any level causes a full unmount/remount of the DOM subtree below it. For deep nesting with frequent toggles:
+- Repeated DOM node creation/destruction
+- Lost transient state (scroll position, focus, input values, animations)
+- GC pressure from short-lived objects
+
+### When to split, when not to
+
+| Pattern | Verdict |
+|---|---|
+| `splitSeq` on a list with stable keys | Great — this is what split is designed for |
+| One level of `splitBoolean`/`splitOption` | Fine — small overhead, cleaner than alternatives |
+| Deeply nested binary splits | Wasteful — each layer adds teardown cost with no caching benefit |
+| `splitBoolean` everywhere instead of `.map` | Overkill unless you need dedup or the inner signal |
+
+**Rule of thumb**: Use `split` for collections. For binary/enum branching, one level is fine. For nested conditional rendering with expensive subtrees, prefer the visibility toggle pattern.
+
 ## Keeping expensive trees alive
 
 None of the split operators support this. Use the **visibility toggle pattern**:
