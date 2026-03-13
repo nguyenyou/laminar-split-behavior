@@ -1,0 +1,7 @@
+.bsp
+.metals
+.scala-build
+.vscode
+.idea
+out
+main.js
