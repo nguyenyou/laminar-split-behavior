@@ -9,18 +9,35 @@ import com.raquo.laminar.api.L.*
 
 var trueCount = 0
 var falseCount = 0
+var emitCount = 0
 
 @main
 def run(): Unit = {
   val container = dom.document.getElementById("app")
   val isOn = Var(false)
+  val emitCountVar = Var(0)
+
+  def emitAndCount(value: Boolean): Unit = {
+    emitCount += 1
+    emitCountVar.set(emitCount)
+    isOn.set(value)
+  }
 
   val app = div(
     h2("splitBoolean re-render test"),
     button(
       "Toggle",
-      onClick --> { _ => isOn.update(!_) }
+      onClick --> { _ => emitAndCount(!isOn.now()) }
     ),
+    button(
+      "Emit true",
+      onClick --> { _ => emitAndCount(true) }
+    ),
+    button(
+      "Emit false",
+      onClick --> { _ => emitAndCount(false) }
+    ),
+    p("Total emissions: ", child.text <-- emitCountVar.signal.map(_.toString)),
     p("Current value: ", child.text <-- isOn.signal.map(_.toString)),
     child <-- isOn.signal.splitBoolean(
       whenTrue = { _ =>
