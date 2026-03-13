@@ -1,34 +1,84 @@
-# Laminar `splitBoolean` Behavior Demo
+# Laminar `split` Family — Cache & Re-render Behavior
 
-This project demonstrates how `splitBoolean` works in Laminar and when to use it.
+Investigation into whether Laminar/Airstream's split operators keep rendered trees in memory or discard them when keys disappear.
 
-## Run
+## Run the demo
 
 ```
 scala-cli --power package main.scala -f -o main.js
 open index.html
 ```
 
-## How `splitBoolean` works
+## TL;DR — split does NOT keep the tree in memory
 
-```scala
-signal.splitBoolean(
-  whenTrue = { unitSignal => renderTrueBranch() },
-  whenFalse = { unitSignal => renderFalseBranch() }
-)
+All split variants use the same `SplitSignal` engine. When a key disappears from the input, its cache entry is **immediately evicted** (`memoized.remove(key)`). When the key reappears, the `project` callback is called again from scratch. There is no config to change this.
+
+## The split family
+
+### Group 1: Collection splits (`Signal[List[A]]`, etc.)
+
+| Operator | Description |
+|---|---|
+| `splitSeq` | Key each item, render once per key |
+| `splitSeqByIndex` | Use index as key |
+| `splitSeqMutate` | Var-only, mutable in-place updates |
+| `splitSomeSeq` / `splitSomeSeqByIndex` | For `Signal[Option[List[A]]]` |
+
+### Group 2: Single-value splits (`Signal[A]`)
+
+All delegate to `splitOne` internally.
+
+| Operator | Keys | Delegates to |
+|---|---|---|
+| `splitOne` | User-defined key function | Core `SplitSignal` |
+| `splitBoolean` | `true` / `false` | `splitOne(identity)` |
+| `splitEither` | `Left` / `Right` | `splitOne` |
+| `splitTry` | `Success` / `Failure` | `splitOne` |
+| `splitStatus` | `Resolved` / `Pending` | `splitOne` |
+| `splitOption` | `Some` / `None` | `splitOne` |
+
+### Group 3: Stream-specific
+
+| Operator | Description |
+|---|---|
+| `splitStart` | Like `splitOne` for streams, with an initial value |
+
+## Cache lifecycle (same for ALL variants)
+
+All variants feed into `SplitSignal`, which maintains:
+
+```
+memoized: Map[Key, (Input, Signal[Input], Output, lastParentUpdateId)]
 ```
 
-Under the hood, `splitBoolean` calls `splitOne(identity)`, which uses `SplitSignal` — the same memoization engine behind `.split` for lists.
+The lifecycle:
 
-The boolean value itself is the cache key. When the value changes:
+1. **Key appears** → `project` callback called once, result cached under that key
+2. **Same key emitted again** → cached result reused, callback NOT re-called
+3. **Key disappears** → cache entry **immediately evicted** (observer removed, `memoized.remove(key)`)
+4. **Key reappears later** → treated as brand new, `project` called again from scratch
 
-1. The **old branch's cache entry is evicted** (removed entirely)
-2. The **new branch's render callback is called fresh**
+There is **no option to retain evicted entries**. No config, no flag — eviction is hardcoded in `SplitSignal.scala`.
 
-This means:
-- **Every toggle re-runs the render callback** for the entering branch
-- Consecutive emissions of the **same** value do NOT re-run the callback
-- There is **no persistent cache across toggles** — unlike `.split` on a list where items that reappear can hit the cache, `splitBoolean` only ever has one key active (`true` or `false`), so the other is always evicted
+## What this means in practice
+
+| Scenario | Behavior |
+|---|---|
+| List item stays across emissions (key persists) | Tree **kept**, inner signal updates cheaply |
+| List item removed then re-added (same key) | Tree **discarded and rebuilt** |
+| Boolean toggled (`splitBoolean`) | Only 1 key active at a time; **re-renders on every toggle** |
+| Option goes `None→Some→None→Some` | `Some` branch **rebuilt** each time |
+| Same value emitted consecutively | Cached, callback **not** re-called |
+
+### Where split saves you work
+
+Split shines when **keys persist across emissions**. For a list of 100 items where 1 item changes:
+- `splitSeq`: only the changed item's inner signal fires; 99 items untouched
+- `.map(_.map(render))`: all 100 re-rendered
+
+### Where split doesn't help
+
+For binary/enum splits (`splitBoolean`, `splitEither`, `splitOption`, etc.), only one key is active at a time, so the other is always evicted. Every state change triggers a full re-render of the entering branch.
 
 ## `splitBoolean` vs `child <-- signal.map(...)`
 
@@ -49,21 +99,21 @@ Both re-create the element on every toggle. The key differences:
 |---|---|---|
 | **Re-renders on toggle** | Yes | Yes |
 | **Re-renders on same value** | No (memoized) | Yes (creates new element every emission) |
-| **Inner signal** | Provides a `StrictSignal[Unit]` you can use to react to re-entries | No inner signal |
-| **Unmount/mount** | Old element unmounted, new element mounted on toggle | Same behavior |
+| **Inner signal** | Provides a `StrictSignal[Unit]` to react to re-entries | No inner signal |
+| **Unmount/mount** | Old element unmounted, new mounted | Same |
 
 ### When to use `splitBoolean`
 
-- **You want deduplication**: If the parent signal may emit the same boolean value multiple times (e.g., from `.combineWith` or noisy sources), `splitBoolean` skips redundant re-renders. With `.map`, every emission creates a new element even if the value didn't change.
-- **You need the inner signal**: The `StrictSignal[Unit]` parameter lets child components know when their branch was re-entered, useful for triggering animations or side effects.
+- **Deduplication**: Parent signal may emit the same boolean value multiple times (e.g., from `.combineWith` or noisy sources). `splitBoolean` skips redundant re-renders; `.map` creates a new element every emission.
+- **Inner signal**: The `StrictSignal[Unit]` lets children react to branch re-entry (animations, side effects).
 
 ### When `.map` is fine
 
-- The signal is already distinct (e.g., a simple `Var` toggle) and you're rendering simple/cheap elements. The overhead difference is negligible.
+- Signal is already distinct (e.g., a simple `Var` toggle) and elements are cheap. Overhead difference is negligible.
 
-### When neither is ideal
+## Keeping expensive trees alive
 
-- If both branches are **expensive to create** and you want to **keep them alive** across toggles (preserve DOM state, scroll position, input values), neither approach works — both destroy and recreate. Instead, render both branches and toggle visibility:
+None of the split operators support this. Use the **visibility toggle pattern**:
 
 ```scala
 div(
@@ -75,3 +125,5 @@ div(
   expensiveFalseElement
 )
 ```
+
+Both elements stay mounted in the DOM. This preserves scroll position, input state, focus, etc. The cost is that both branches are always in the DOM (just hidden).
